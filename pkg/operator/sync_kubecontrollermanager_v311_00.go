@@ -6,8 +6,12 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	appsclientv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
 	coreclientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
@@ -25,6 +29,9 @@ func syncKubeControllerManager_v311_00_to_latest(c KubeControllerManagerOperator
 	versionAvailability := operatorsv1alpha1.VersionAvailablity{
 		Version: operatorConfig.Spec.Version,
 	}
+	v1alpha1Scheme := runtime.NewScheme()
+	v1alpha1.Install(v1alpha1Scheme)
+	v1alpha1Codecs := serializer.NewCodecFactory(v1alpha1Scheme)
 
 	errors := []error{}
 	var err error
@@ -59,12 +66,34 @@ func syncKubeControllerManager_v311_00_to_latest(c KubeControllerManagerOperator
 		errors = append(errors, fmt.Errorf("%q: %v", "sa", err))
 	}
 
+	operatorConfigBytes := v311_00_assets.MustAsset("v3.11.0/kube-controller-manager/operator-config.yaml")
+	operatorConfigObj, err := runtime.Decode(v1alpha1Codecs.UniversalDecoder(v1alpha1.GroupVersion), operatorConfigBytes)
+	if err != nil {
+		errors = append(errors, err)
+	}
+	requiredOperatorConfig, ok := operatorConfigObj.(*v1alpha1.KubeControllerManagerOperatorConfig)
+	if !ok {
+		errors = append(errors, fmt.Errorf("operator-config.yaml is not v1alpha1.KubeControllerManagerOperatorConfig (%t)", operatorConfigObj))
+	}
+	imagePullSpec := os.Getenv("IMAGE")
+	if len(imagePullSpec) == 0 {
+		errors = append(errors, fmt.Errorf("required environment variable IMAGE is not set"))
+	}
+	requiredOperatorConfig.Spec.ImagePullSpec = imagePullSpec
+	_, configModified, err := applyKubeControllerManagerOperatorConfig(c.operatorConfigClient, requiredOperatorConfig)
+	if err != nil {
+		errors = append(errors, err)
+	}
+
 	controllerManagerConfig, configMapModified, err := manageKubeControllerManagerConfigMap_v311_00_to_latest(c.corev1Client, operatorConfig)
 	if err != nil {
 		errors = append(errors, fmt.Errorf("%q: %v", "configmap", err))
 	}
 
 	forceDeployment := operatorConfig.ObjectMeta.Generation != operatorConfig.Status.ObservedGeneration
+	if configModified {
+		forceDeployment = true
+	}
 	if saModified { // SA modification can cause new tokens
 		forceDeployment = true
 	}
@@ -89,6 +118,28 @@ func syncKubeControllerManager_v311_00_to_latest(c KubeControllerManagerOperator
 	}
 
 	return resourcemerge.ApplyGenerationAvailability(versionAvailability, actualDeployment, errors...), errors
+}
+
+func applyKubeControllerManagerOperatorConfig(client operatorsclientv1alpha1.KubeControllerManagerOperatorConfigsGetter, required *v1alpha1.KubeControllerManagerOperatorConfig) (*v1alpha1.KubeControllerManagerOperatorConfig, bool, error) {
+	existing, err := client.KubeControllerManagerOperatorConfigs().Get(required.Name, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		actual, err := client.KubeControllerManagerOperatorConfigs().Create(required)
+		return actual, true, err
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	modified := resourcemerge.BoolPtr(false)
+	resourcemerge.EnsureObjectMeta(modified, &existing.ObjectMeta, required.ObjectMeta)
+	dataSame := equality.Semantic.DeepEqual(existing.Spec, required.Spec)
+	if dataSame && !*modified {
+		return existing, false, nil
+	}
+	existing.Spec = required.Spec
+
+	actual, err := client.KubeControllerManagerOperatorConfigs().Update(existing)
+	return actual, true, err
 }
 
 func manageKubeControllerManagerConfigMap_v311_00_to_latest(client coreclientv1.ConfigMapsGetter, operatorConfig *v1alpha1.KubeControllerManagerOperatorConfig) (*corev1.ConfigMap, bool, error) {
