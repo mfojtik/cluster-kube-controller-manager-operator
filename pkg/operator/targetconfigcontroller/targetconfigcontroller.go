@@ -202,7 +202,7 @@ func manageKubeControllerManagerConfig(client corev1client.ConfigMapsGetter, rec
 
 func managePod(client corev1client.ConfigMapsGetter, recorder events.Recorder, operatorConfig *operatorv1.KubeControllerManager, imagePullSpec string) (*corev1.ConfigMap, bool, error) {
 	required := resourceread.ReadPodV1OrDie(v311_00_assets.MustAsset("v3.11.0/kube-controller-manager/pod.yaml"))
-	required.Spec.Containers[0].ImagePullPolicy = corev1.PullAlways
+	required.Spec.Containers[0].ImagePullPolicy = corev1.PullIfNotPresent
 	if len(imagePullSpec) > 0 {
 		required.Spec.Containers[0].Image = imagePullSpec
 	}
